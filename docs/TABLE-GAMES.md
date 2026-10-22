@@ -111,8 +111,28 @@ The client shows and checks the avatar's own gold and funnies (character
 data block 4, default 1000 each; live updates by 3201 `{ownr, lvl, exp,
 gold, glod}`). In a game state, `crdts` is a player's chips now and
 `accnt` the chips brought in total (the rebuy cap is balance − `accnt`).
-sadk-lobby keeps chips per seat only: winnings do not reach the balance
-yet.
+The client only reads block 4 when the data is in the full six-block
+layout (`sub_480F10`); data with just the 44-byte creation block shows 50
+gold and 50 funnies.
+
+sadk-lobby keeps gold and funnies per character in `accounts.json`
+(new characters, and those saved before balances were kept, start with
+20 each) and treats the balance
+the way the rebuy cap suggests: the chips at the table still count as the
+player's own, so nothing is taken when they sit down.
+
+- The character list (UserCharConn / CharacterData) carries the balance
+  as block 4 (version 1: version, level 1, exp 0, gold, funnies); a
+  creation-only character is sent split into the appearance and style
+  blocks, so the look is the same.
+- 2001 and 209 are refused (219 / 220) when the stake is more than the
+  balance in the table's currency; a rebuy (222) is cut to balance −
+  `accnt`.
+- Standing up (204), leaving for a match or disconnecting books
+  `crdts − accnt` on the character, saves it and sends 3201 to the
+  player. No balance goes below 10: losses beyond that are forgiven, so
+  everyone can always sit down again. Entering the village also sends
+  3201. A server crash while seated changes nothing.
 
 ## Pawn chess
 

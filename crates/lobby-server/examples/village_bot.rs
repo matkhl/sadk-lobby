@@ -51,6 +51,10 @@ use std::net::TcpStream;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// The chips the bot brings to a table: the lowest balance a character can
+/// have, so the lobby never refuses it.
+const BUY_IN: u32 = 10;
+
 struct Options {
     msgdefs: String,
     lobby: String,
@@ -253,24 +257,24 @@ fn run() -> Result<(), String> {
     let mut poker_bot = PokerBot::default();
     if o.poker.as_deref() == Some("create") {
         let mut w = BitWriter::new();
-        // Poker for funnies, 200 chips, "Bot", big blind 10, four seats, no password.
-        w.bits(GameKind::Poker as u32, 8).bits(1, 8).u32(200).str("Bot").u32(10).u32(0x7fff_ffff);
+        // Poker for funnies, 10 chips, "Bot", big blind 2, four seats, no password.
+        w.bits(GameKind::Poker as u32, 8).bits(1, 8).u32(BUY_IN).str("Bot").u32(2).u32(0x7fff_ffff);
         w.bits(4, 8).bits(o.table.0 as u32, 8).bits(o.table.1 as u32, 8).bits(0, 8).u32(0);
         village.send_village(2, mg::id::CREATE, w.finish())?;
         println!("-> opening a poker table at tavern {} table {}", o.table.0, o.table.1);
     }
     if o.dice.as_deref() == Some("create") {
         let mut w = BitWriter::new();
-        // Dice for funnies, 100 chips, "Bot", minimum 1, four seats, no password.
-        w.bits(GameKind::Dice as u32, 8).bits(1, 8).u32(100).str("Bot").u32(1).u32(0x7fff_ffff);
+        // Dice for funnies, 10 chips, "Bot", minimum 1, four seats, no password.
+        w.bits(GameKind::Dice as u32, 8).bits(1, 8).u32(BUY_IN).str("Bot").u32(1).u32(0x7fff_ffff);
         w.bits(4, 8).bits(o.table.0 as u32, 8).bits(o.table.1 as u32, 8).bits(0, 8).u32(0);
         village.send_village(2, mg::id::CREATE, w.finish())?;
         println!("-> opening a dice table at tavern {} table {}", o.table.0, o.table.1);
     }
     if o.chess.as_deref() == Some("create") {
         let mut w = BitWriter::new();
-        // Pawn chess for funnies, 100 chips, "Bot", 5 a game, two seats, no password.
-        w.bits(GameKind::PawnChess as u32, 8).bits(1, 8).u32(100).str("Bot").u32(5).u32(0x7fff_ffff);
+        // Pawn chess for funnies, 10 chips, "Bot", 2 a game, two seats, no password.
+        w.bits(GameKind::PawnChess as u32, 8).bits(1, 8).u32(BUY_IN).str("Bot").u32(2).u32(0x7fff_ffff);
         w.bits(2, 8).bits(o.table.0 as u32, 8).bits(o.table.1 as u32, 8).bits(0, 8).u32(0);
         village.send_village(2, mg::id::CREATE, w.finish())?;
         println!("-> opening a pawn chess table at tavern {} table {}", o.table.0, o.table.1);
@@ -388,7 +392,7 @@ impl Chess {
                 self.asked = true;
                 let mut w = BitWriter::new();
                 key.write(&mut w);
-                w.u32(100).u32(0);
+                w.u32(BUY_IN).u32(0);
                 println!("-> joining pawn chess table {key:?}");
                 village.send_village(5, mg::id::JOIN, w.finish())?;
             }
@@ -477,7 +481,7 @@ impl DiceBot {
                 self.asked = true;
                 let mut w = BitWriter::new();
                 key.write(&mut w);
-                w.u32(100).u32(0);
+                w.u32(BUY_IN).u32(0);
                 println!("-> joining dice table {key:?}");
                 village.send_village(5, mg::id::JOIN, w.finish())?;
             }
@@ -611,7 +615,7 @@ impl PokerBot {
                 self.asked = true;
                 let mut w = BitWriter::new();
                 key.write(&mut w);
-                w.u32(200).u32(0);
+                w.u32(BUY_IN).u32(0);
                 println!("-> joining poker table {key:?}");
                 village.send_village(5, mg::id::JOIN, w.finish())?;
             }

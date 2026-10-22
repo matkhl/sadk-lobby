@@ -5,7 +5,7 @@
 //! `TinCat_Scramble` is used only by the old `RequestLogin` message. We
 //! store `sha256(salt || password bytes)`, so the file holds no password.
 
-use sadk_lobby_proto::lobby_message::repair_character_data;
+use sadk_lobby_proto::lobby_message::{repair_character_data, Stats};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -62,13 +62,55 @@ pub struct Mail {
 }
 
 /// A lobby avatar. `data` is the client's look of it: six `u32` block sizes,
-/// then the blocks (`lobby_message::character_blocks`).
+/// then the blocks (`lobby_message::character_blocks`). The balance is the
+/// server's: block 4 of `data` is replaced by it on the way out
+/// (`lobby_message::with_stats`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Character {
     pub id: u32,
     pub name: String,
     #[serde(with = "hex_bytes")]
     pub data: Vec<u8>,
+    #[serde(default = "start_gold")]
+    pub gold: u32,
+    #[serde(default = "start_funnies")]
+    pub funnies: u32,
+}
+
+/// What a new character starts with, in gold and in funnies. Characters
+/// saved before balances were kept get it too.
+pub const START_BALANCE: u32 = 20;
+
+/// No balance goes below this: losses beyond it are forgiven, so a player
+/// can always sit down at a table again.
+pub const MIN_BALANCE: u32 = 10;
+
+fn start_gold() -> u32 {
+    START_BALANCE
+}
+
+fn start_funnies() -> u32 {
+    START_BALANCE
+}
+
+impl Character {
+    pub fn new(id: u32, name: &str, data: Vec<u8>) -> Self {
+        Self { id, name: name.to_string(), data, gold: start_gold(), funnies: start_funnies() }
+    }
+
+    /// Level and experience are not kept: every character is level 1.
+    pub fn stats(&self) -> Stats {
+        Stats { gold: self.gold, funnies: self.funnies, ..Stats::default() }
+    }
+
+    /// The balance in funnies or gold.
+    pub fn balance(&self, funnies: bool) -> u32 {
+        if funnies {
+            self.funnies
+        } else {
+            self.gold
+        }
+    }
 }
 
 mod hex_bytes {
@@ -239,7 +281,7 @@ impl Accounts {
             return Ok(None);
         }
         let id = self.fresh_id();
-        let character = Character { id, name: name.to_string(), data };
+        let character = Character::new(id, name, data);
         self.by_id(owner).unwrap().characters.push(character.clone());
         self.save()?;
         Ok(Some(character))
@@ -268,6 +310,20 @@ impl Accounts {
         }
         self.save()?;
         Ok(true)
+    }
+
+    /// Adds `delta` to a character's funnies or gold (never below
+    /// [`MIN_BALANCE`]) and saves; returns the new stats, or `None` for an
+    /// unknown character.
+    pub fn add_balance(&mut self, char_id: u32, funnies: bool, delta: i64) -> std::io::Result<Option<Stats>> {
+        let Some(c) = self.store.accounts.values_mut().flat_map(|a| a.characters.iter_mut()).find(|c| c.id == char_id) else {
+            return Ok(None);
+        };
+        let balance = if funnies { &mut c.funnies } else { &mut c.gold };
+        *balance = (*balance as i64 + delta).clamp(MIN_BALANCE as i64, u32::MAX as i64) as u32;
+        let stats = c.stats();
+        self.save()?;
+        Ok(Some(stats))
     }
 
     pub fn remove_character(&mut self, owner: u32, id: u32) -> std::io::Result<bool> {
@@ -497,6 +553,30 @@ mod tests {
         // The repair was saved.
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains(&super::hex(&fixed)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn balances_start_at_20_and_never_go_below_10() {
+        let dir = std::env::temp_dir().join(format!("sadk-lobby-test-balance-{}", std::process::id()));
+        let path = dir.join("accounts.json");
+        let _ = std::fs::remove_file(&path);
+        let mut accounts = Accounts::open(path.clone()).unwrap();
+        let a = accounts.create("spieler", b"x").unwrap().unwrap();
+        let c = accounts.add_character(a.id, "Spieler", vec![]).unwrap().unwrap();
+        assert_eq!((c.gold, c.funnies), (20, 20));
+        let s = accounts.add_balance(c.id, false, 7).unwrap().unwrap();
+        assert_eq!((s.gold, s.funnies), (27, 20));
+        let s = accounts.add_balance(c.id, true, -15).unwrap().unwrap();
+        assert_eq!((s.gold, s.funnies), (27, 10), "losses below 10 are forgiven");
+        assert_eq!(accounts.add_balance(999, true, 1).unwrap(), None);
+        // Saved, and characters saved without a balance get the start one.
+        let reopened = Accounts::open(path.clone()).unwrap();
+        assert_eq!(reopened.character(c.id, "").unwrap().1.funnies, 10);
+        let text = std::fs::read_to_string(&path).unwrap().replace("\"gold\": 27,", "").replace("\"funnies\": 10", "\"x\": 0");
+        std::fs::write(&path, text).unwrap();
+        let old = Accounts::open(path).unwrap();
+        assert_eq!((old.character(c.id, "").unwrap().1.gold, old.character(c.id, "").unwrap().1.funnies), (20, 20));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

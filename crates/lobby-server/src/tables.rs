@@ -10,6 +10,13 @@
 //!
 //! Each table has its own chat channel; the client joins it by itself when
 //! it sees its own seat.
+//!
+//! Money: a player brings chips from their gold or funnies (the table's
+//! currency) and may not bring more than that balance. The balance is not
+//! touched while they sit: the client caps a rebuy at balance minus the
+//! chips brought (`accnt`), so it counts the chips at the table as still
+//! its own. Leaving settles the difference (`Left`), which the session
+//! books on the character.
 
 use crate::village::Event;
 use sadk_lobby_proto::dice::{self, Dice};
@@ -29,7 +36,35 @@ pub const CHAT_BASE: u32 = 1000;
 
 struct Watcher {
     avatar: u32,
+    balance: Balance,
     tx: UnboundedSender<Event>,
+}
+
+/// A character's gold and funnies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Balance {
+    pub gold: u32,
+    pub funnies: u32,
+}
+
+impl Balance {
+    fn get(&self, funnies: bool) -> u32 {
+        if funnies {
+            self.funnies
+        } else {
+            self.gold
+        }
+    }
+}
+
+/// A player stood up: their character's balance changes by `delta` in the
+/// table's currency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Left {
+    pub key: TableKey,
+    pub avatar: u32,
+    pub funnies: bool,
+    pub delta: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,6 +243,8 @@ pub enum Refused {
     Full,
     WrongPassword,
     TooFewChips,
+    /// The stake is more than the player's gold or funnies.
+    NotEnoughMoney,
     AlreadySeated,
     NotSeated,
     UnknownAction,
@@ -301,23 +338,36 @@ impl Tables {
         self.send_all(msgs);
     }
 
-    /// A village session starts watching: it gets every table.
-    pub fn watch(&mut self, conn: u32, avatar: u32, tx: UnboundedSender<Event>) {
+    /// A village session starts watching: it gets every table. `balance` is
+    /// its character's money, which caps the chips it can bring.
+    pub fn watch(&mut self, conn: u32, avatar: u32, balance: Balance, tx: UnboundedSender<Event>) {
         let now = self.now();
         for t in self.tables.values() {
             for (id, data) in t.announce(now) {
                 let _ = tx.send(Event::Village { id, data });
             }
         }
-        self.watchers.insert(conn, Watcher { avatar, tx });
+        self.watchers.insert(conn, Watcher { avatar, balance, tx });
+    }
+
+    /// The character's money changed (after a settlement).
+    pub fn set_balance(&mut self, conn: u32, balance: Balance) {
+        if let Some(w) = self.watchers.get_mut(&conn) {
+            w.balance = balance;
+        }
+    }
+
+    fn balance(&self, conn: u32) -> Balance {
+        self.watchers.get(&conn).map_or_else(Balance::default, |w| w.balance)
     }
 
     /// The session leaves the village: it stands up from its table. Call
     /// this before the avatar leaves the village, so no client keeps a
     /// seat for an avatar it no longer has.
-    pub fn unwatch(&mut self, conn: u32) {
-        self.leave(conn);
+    pub fn unwatch(&mut self, conn: u32) -> Option<Left> {
+        let left = self.leave(conn);
         self.watchers.remove(&conn);
+        left
     }
 
     pub fn get(&self, key: &TableKey) -> Option<&Table> {
@@ -344,6 +394,9 @@ impl Tables {
         let limit_min = c.limit_min.max(1);
         if c.stake < limit_min {
             return Err(Refused::TooFewChips);
+        }
+        if c.stake > self.balance(conn).get(c.play_money) {
+            return Err(Refused::NotEnoughMoney);
         }
         let scene = c.tavern + 2;
         let big_poker = kind == GameKind::Poker && c.max_players > 4;
@@ -400,8 +453,12 @@ impl Tables {
             return Err(Refused::AlreadySeated);
         }
         let avatar = self.watchers.get(&conn).map_or(0, |w| w.avatar);
+        let balance = self.balance(conn);
         let now = self.now();
         let t = self.tables.get_mut(&j.key).ok_or(Refused::NoSuchTable)?;
+        if j.stake > balance.get(t.funnies) {
+            return Err(Refused::NotEnoughMoney);
+        }
         if t.settings.password.is_some_and(|crc| crc != j.password) {
             return Err(Refused::WrongPassword);
         }
@@ -420,8 +477,9 @@ impl Tables {
     }
 
     /// Message 204 or leaving the village: stand up (a running game is
-    /// lost); the last one out closes the table.
-    pub fn leave(&mut self, conn: u32) -> Option<TableKey> {
+    /// lost); the last one out closes the table. Returns what the player's
+    /// balance gains or loses.
+    pub fn leave(&mut self, conn: u32) -> Option<Left> {
         let key = self.table_of(conn)?;
         let now = self.now();
         let t = self.tables.get_mut(&key)?;
@@ -442,14 +500,14 @@ impl Tables {
             }
             Game::Poker(g) => {
                 let out = g.left(seat, now, &mut stacks);
-                t.seats[seat] = None;
                 t.set_stacks(&stacks);
                 if let Some(out) = out.filter(|o| !o.hole_cards.is_empty()) {
                     msgs.extend(t.poker_step(&out, now).into_iter().filter(|m| m.0.is_some()));
                 }
             }
         }
-        t.seats[seat] = None;
+        let gone = t.seats[seat].take()?;
+        let left = Left { key, avatar: gone.avatar, funnies: t.funnies, delta: gone.credits as i64 - gone.account as i64 };
         if t.is_empty() {
             let t = self.tables.remove(&key)?;
             self.broadcast(mg::id::TABLE_REMOVE, t.encode(0, now));
@@ -458,7 +516,7 @@ impl Tables {
             self.send_all(msgs);
             self.broadcast(id, data);
         }
-        Some(key)
+        Some(left)
     }
 
     /// An action at the player's table (channel 5, after the table key):
@@ -467,13 +525,17 @@ impl Tables {
     /// a new `trnid` before it takes input again.
     pub fn act(&mut self, conn: u32, key: TableKey, id: u16, r: &mut BitReader) -> Result<(), Refused> {
         let now = self.now();
+        let balance = self.balance(conn);
         let t = self.tables.get_mut(&key).ok_or(Refused::NoSuchTable)?;
         let seat = t.seat_of(conn).ok_or(Refused::NotSeated)?;
         let mut private = Vec::new();
         let mut stacks = t.stacks();
         let result = if id == mg::id::REBUY {
             let amount = r.u32().ok_or(Refused::UnknownAction)?;
+            let funnies = t.funnies;
             if let Some(Some(o)) = t.seats.get_mut(seat) {
+                // No more than the balance not yet brought to the table.
+                let amount = amount.min(balance.get(funnies).saturating_sub(o.account));
                 o.credits = o.credits.saturating_add(amount);
                 o.account = o.account.saturating_add(amount);
             }
@@ -548,6 +610,8 @@ mod tests {
     use sadk_lobby_proto::minigame::TableMessage;
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
+    const RICH: Balance = Balance { gold: 1000, funnies: 1000 };
+
     fn drain(rx: &mut UnboundedReceiver<Event>) -> Vec<(u16, Vec<u8>)> {
         std::iter::from_fn(|| rx.try_recv().ok())
             .map(|e| match e {
@@ -581,7 +645,7 @@ mod tests {
         let mut t = Tables::default();
         let (a_tx, mut a) = unbounded_channel();
         let (b_tx, mut b) = unbounded_channel();
-        t.watch(1, 10, a_tx);
+        t.watch(1, 10, RICH, a_tx);
         let key = t.create(1, &create(1, 4, None)).unwrap();
         let out = drain(&mut a);
         assert_eq!(out.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [mg::id::TABLE_CREATE, mg::id::TABLE_UPDATE]);
@@ -593,7 +657,7 @@ mod tests {
         let m = TableMessage::read(&mut BitReader::new(&out[1].1)).unwrap();
         assert_eq!(m.seats.unwrap(), [Seat { index: 0, actor_kind: ACTOR_AVATAR, actor: 10 }]);
 
-        t.watch(2, 20, b_tx);
+        t.watch(2, 20, RICH, b_tx);
         assert_eq!(ids(&mut b), [mg::id::TABLE_CREATE, mg::id::TABLE_UPDATE]);
         assert_eq!(t.join(2, &Join { key, stake: 10, password: 0 }), Ok(1));
         assert_eq!(ids(&mut a), [mg::id::TABLE_UPDATE]);
@@ -612,7 +676,7 @@ mod tests {
         let mut t = Tables::default();
         let (tx, _rx) = unbounded_channel();
         for c in 1..=6 {
-            t.watch(c, c * 10, tx.clone());
+            t.watch(c, c * 10, RICH, tx.clone());
         }
         assert_eq!(t.create(1, &create(9, 2, None)), Err(Refused::UnknownGame));
         assert_eq!(t.create(1, &CreateTable { tavern: 2, ..create(3, 2, None) }), Err(Refused::NoSuchTavern));
@@ -633,7 +697,7 @@ mod tests {
         let mut t = Tables::default();
         let (tx, _rx) = unbounded_channel();
         for c in 1..=4 {
-            t.watch(c, c * 10, tx.clone());
+            t.watch(c, c * 10, RICH, tx.clone());
         }
         let any = |kind, max| CreateTable { table: mg::ANY_TABLE, ..create(kind, max, None) };
         let a = t.create(1, &any(3, 2)).unwrap();
@@ -663,8 +727,8 @@ mod tests {
         use pawnchess::phase;
         let mut t = Tables::default();
         let (tx, mut rx) = unbounded_channel();
-        t.watch(1, 10, tx.clone());
-        t.watch(2, 20, tx);
+        t.watch(1, 10, RICH, tx.clone());
+        t.watch(2, 20, RICH, tx);
         // Stake per game is lmtmn = 1 here; both bring 10 chips.
         let key = t.create(1, &create(3, 4, None)).unwrap();
         assert_eq!(t.get(&key).unwrap().seats.len(), 2);
@@ -700,8 +764,8 @@ mod tests {
         use pawnchess::phase;
         let mut t = Tables::default();
         let (tx, _rx) = unbounded_channel();
-        t.watch(1, 10, tx.clone());
-        t.watch(2, 20, tx);
+        t.watch(1, 10, RICH, tx.clone());
+        t.watch(2, 20, RICH, tx);
         let key = t.create(1, &CreateTable { limit_min: 5, stake: 5, ..create(3, 2, None) }).unwrap();
         t.join(2, &Join { key, stake: 5, password: 0 }).unwrap();
         act(&mut t, 1, key, 402, &[3]).unwrap();
@@ -730,8 +794,8 @@ mod tests {
         use sadk_lobby_proto::dice::{self as d, phase};
         let mut t = Tables::default();
         let (tx, mut rx) = unbounded_channel();
-        t.watch(1, 10, tx.clone());
-        t.watch(2, 20, tx);
+        t.watch(1, 10, RICH, tx.clone());
+        t.watch(2, 20, RICH, tx);
         // One player is enough for dice: betting starts at once.
         let key = t.create(1, &create(1, 4, None)).unwrap();
         assert_eq!(dice_game(&t, &key).phase, phase::BETS);
@@ -789,8 +853,8 @@ mod tests {
         let mut t = Tables::default();
         let (a_tx, mut a) = unbounded_channel();
         let (b_tx, mut b) = unbounded_channel();
-        t.watch(1, 10, a_tx);
-        t.watch(2, 20, b_tx);
+        t.watch(1, 10, RICH, a_tx);
+        t.watch(2, 20, RICH, b_tx);
         let key = t.create(1, &CreateTable { limit_min: 2, ..create(2, 4, None) }).unwrap();
         t.join(2, &Join { key, stake: 10, password: 0 }).unwrap();
         drain(&mut a);
@@ -841,5 +905,30 @@ mod tests {
         t.skip(poker::COLLECT_MS);
         t.tick();
         assert_eq!(credits(&t, &key), [9 - 2 + 3]);
+    }
+
+    #[test]
+    fn stakes_come_from_the_balance_and_leaving_settles() {
+        use pawnchess::phase;
+        let mut t = Tables::default();
+        let (tx, _rx) = unbounded_channel();
+        t.watch(1, 10, Balance { gold: 0, funnies: 12 }, tx.clone());
+        t.watch(2, 20, Balance { gold: 500, funnies: 8 }, tx);
+        // Funnies table (play_money): 13 is more than seat 0 has.
+        assert_eq!(t.create(1, &CreateTable { stake: 13, ..create(3, 2, None) }), Err(Refused::NotEnoughMoney));
+        let key = t.create(1, &CreateTable { stake: 10, limit_min: 5, ..create(3, 2, None) }).unwrap();
+        assert_eq!(t.join(2, &Join { key, stake: 10, password: 0 }), Err(Refused::NotEnoughMoney), "only 8 funnies");
+        t.join(2, &Join { key, stake: 8, password: 0 }).unwrap();
+        // A rebuy is capped at the balance not yet at the table: 12 - 10.
+        act(&mut t, 1, key, mg::id::REBUY, &[0, 0, 0, 50]).unwrap();
+        let o = t.get(&key).unwrap().seats[0].clone().unwrap();
+        assert_eq!((o.credits, o.account), (12, 12));
+        // Both pay the stake of 5; seat 1 leaves mid-game and loses it.
+        act(&mut t, 1, key, 402, &[3]).unwrap();
+        act(&mut t, 2, key, 402, &[4]).unwrap();
+        assert_eq!(chess(&t, &key).phase, phase::MOVE_0);
+        assert_eq!(t.leave(2), Some(Left { key, avatar: 20, funnies: true, delta: -5 }));
+        assert_eq!(t.unwatch(1), Some(Left { key, avatar: 10, funnies: true, delta: 5 }));
+        assert_eq!(t.unwatch(1), None);
     }
 }

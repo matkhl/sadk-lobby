@@ -30,8 +30,9 @@ Known gaps: avatar items and stats are not sent to other players; the MINIGAME c
 not handled; a letter's sender shows "???" until the reader has seen that
 player (a client limitation); RANDOM tribes are never resolved by the game,
 so a character without a valid tribe crashes map loading. The rankings
-(Hall of Fame) are not implemented. Chips won at the tavern tables stay
-at the table: the gold and funnies balance is not updated.
+(Hall of Fame) are not implemented. Shop items are not stored: a
+character only keeps its gold and funnies (start 20 each, never below 10),
+which the tavern tables settle when a player stands up.
 
 ## Build
 

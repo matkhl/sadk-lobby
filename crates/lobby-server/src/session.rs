@@ -1,6 +1,7 @@
 //! One client connection: handshake, then request/response on lobby messages.
 
 use crate::accounts::{Account, Character, List, LoginError};
+use crate::tables::{Balance, Left};
 use crate::village::Event;
 use crate::{Role, Server};
 use sadk_lobby_proto::auth::{self, Credentials};
@@ -164,7 +165,8 @@ impl Session {
         // Off the table first: clients must not keep a seat for an avatar
         // they were told is gone.
         if self.role == Role::Village {
-            self.server.tables.lock().unwrap().unwatch(self.id);
+            let left = self.server.tables.lock().unwrap().unwatch(self.id);
+            self.settle(left);
         }
         if self.avatar.is_some() {
             self.server.world.lock().unwrap().leave(self.id);
@@ -548,15 +550,36 @@ impl Session {
     fn enter_village(&mut self, char_id: u32) {
         let character = {
             let accounts = self.server.accounts.lock().unwrap();
-            accounts.character(char_id, "").map(|(_, c)| (c.id, lm::Style::from_character(&c.name, &c.data)))
+            accounts.character(char_id, "").map(|(_, c)| (c.id, lm::Style::from_character(&c.name, &c.data), c.stats()))
         };
-        let Some((avatar, style)) = character.filter(|_| char_id != 0) else {
+        let Some((avatar, style, stats)) = character.filter(|_| char_id != 0) else {
             return warn!(conn = self.id, char_id, "no such character; others will not see this avatar");
         };
         info!(conn = self.id, avatar, "entering the village as {}", style.name);
         self.avatar = Some(avatar);
         self.server.world.lock().unwrap().join(self.id, avatar, style, self.events_tx.clone());
-        self.server.tables.lock().unwrap().watch(self.id, avatar, self.events_tx.clone());
+        let balance = Balance { gold: stats.gold, funnies: stats.funnies };
+        self.server.tables.lock().unwrap().watch(self.id, avatar, balance, self.events_tx.clone());
+        // The character list already carried the balance; this keeps a
+        // client that kept its avatar from an earlier visit current.
+        self.send_village(lm::id::STATS, stats.message(avatar));
+    }
+
+    /// Books what a player won or lost at a table on their character and
+    /// tells their client (3201), which shows and checks the balance.
+    fn settle(&mut self, left: Option<Left>) {
+        let Some(left) = left else { return };
+        let currency = if left.funnies { "funnies" } else { "gold" };
+        let booked = self.server.accounts.lock().unwrap().add_balance(left.avatar, left.funnies, left.delta);
+        match booked {
+            Ok(Some(stats)) => {
+                info!(conn = self.id, avatar = left.avatar, delta = left.delta, gold = stats.gold, funnies = stats.funnies, "settled {currency}");
+                self.server.tables.lock().unwrap().set_balance(self.id, Balance { gold: stats.gold, funnies: stats.funnies });
+                self.send_village(lm::id::STATS, stats.message(left.avatar));
+            }
+            Ok(None) => warn!(conn = self.id, avatar = left.avatar, delta = left.delta, "no character to settle {currency} on"),
+            Err(e) => warn!(conn = self.id, avatar = left.avatar, delta = left.delta, "settling {currency} not saved: {e}"),
+        }
     }
 
     /// Village message from the client: 2000 (own position) is shared with
@@ -580,7 +603,8 @@ impl Session {
             },
             lm::id::LEAVE if !typed => {
                 info!(conn = self.id, "leaving the village for a match");
-                self.server.tables.lock().unwrap().unwatch(self.id);
+                let left = self.server.tables.lock().unwrap().unwatch(self.id);
+                self.settle(left);
                 if self.avatar.take().is_some() {
                     self.server.world.lock().unwrap().leave(self.id);
                 }
@@ -633,10 +657,15 @@ impl Session {
                     }
                 }
             }
-            mg::id::LEAVE => match tables.leave(self.id) {
-                Some(key) => info!(conn = self.id, ?key, "stood up from a table"),
-                None => debug!(conn = self.id, "table leave without a seat"),
-            },
+            mg::id::LEAVE => {
+                let left = tables.leave(self.id);
+                drop(tables);
+                match left {
+                    Some(l) => info!(conn = self.id, key = ?l.key, delta = l.delta, "stood up from a table"),
+                    None => debug!(conn = self.id, "table leave without a seat"),
+                }
+                self.settle(left);
+            }
             _ => match mg::action(data) {
                 Some((key, mut r)) => match tables.act(self.id, key, id, &mut r) {
                     Ok(()) => debug!(conn = self.id, ?key, "table action {id}: {}", hex_preview(data)),
@@ -1046,7 +1075,7 @@ impl Session {
             .with("owner_id", Value::Int(owner.id as i64))
             .with("owner_name", Value::text(&owner.nick))
             .with("status", Value::Int(1))
-            .with("data", Value::Bytes(Some(c.data.clone())))
+            .with("data", Value::Bytes(Some(lm::with_stats(&c.data, &c.stats()))))
             .with("ticket_id", Value::Int(ticket))
     }
 

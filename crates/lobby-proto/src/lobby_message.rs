@@ -45,6 +45,10 @@ pub mod id {
     pub const PING: u16 = 3798;
     /// Server → client: the ping code echoed back.
     pub const PONG: u16 = 3799;
+    /// Server → client: an avatar's level, experience and balance
+    /// ([`super::Stats::message`]); the client shows and checks the own
+    /// avatar's gold and funnies from it (`sub_46BEC0`).
+    pub const STATS: u16 = 3201;
 }
 
 /// The code in [`id::LEAVE_OK`] that lets the client go.
@@ -187,6 +191,68 @@ pub fn character_blocks(data: &[u8]) -> Option<[&[u8]; 6]> {
         at += sizes[i];
         block
     }))
+}
+
+/// Level, experience and balance of a character: block 4 of its data
+/// (`AvatarStatsBlockEx`, read by `sub_485A40`) and message 3201.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stats {
+    pub level: u32,
+    pub exp: u32,
+    pub gold: u32,
+    pub funnies: u32,
+}
+
+impl Default for Stats {
+    /// The client's own defaults for a character without a stats block.
+    fn default() -> Self {
+        Self { level: 1, exp: 0, gold: 1000, funnies: 1000 }
+    }
+}
+
+impl Stats {
+    /// Block 4, version 1 (little-endian `u32`s): version, level, exp, gold,
+    /// funnies. Version 2 adds the avatar's village position and heading,
+    /// which the client then spawns at; version 1 leaves its default spot.
+    pub fn block(&self) -> Vec<u8> {
+        [1, self.level, self.exp, self.gold, self.funnies].iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// Message 3201 for avatar `owner`: `ownr, lvl, exp, gold, glod`.
+    pub fn message(&self, owner: u32) -> Vec<u8> {
+        BitWriter::new().u32(owner).u32(self.level).u32(self.exp).u32(self.gold).u32(self.funnies).finish()
+    }
+}
+
+/// A character's `data` as the client should get it: in the full block
+/// layout, with `stats` as block 4.
+///
+/// The client reads gold and funnies from block 4 only in the full layout
+/// (`sub_480F10`). Data with only a creation block (what character creation
+/// sends, see [`Style::from_character`]) gets 50 gold and 50 funnies there,
+/// so the creation block is split into the appearance block (`u32` version
+/// 0, tribe, gender) and the style block (`u32` version, hair, skin, shirt,
+/// trousers, the four extra colours when the version is not 0), which the
+/// client reads into the same look. Data that does not split into blocks
+/// gets the client's default look.
+pub fn with_stats(data: &[u8], stats: &Stats) -> Vec<u8> {
+    let mut blocks: [Vec<u8>; 6] = match character_blocks(data) {
+        Some(b) => b.map(<[u8]>::to_vec),
+        None => Default::default(),
+    };
+    let creation_only = !matches!(blocks[0].len(), 0 | 12) && blocks[1..].iter().all(Vec::is_empty);
+    if creation_only {
+        let creation = std::mem::take(&mut blocks[0]);
+        let word = |i: usize| creation.get(4 * i..4 * i + 4).map_or([0; 4], |b| b.try_into().unwrap());
+        blocks[0] = [[0; 4], word(1), word(2)].concat();
+        blocks[1] = [&creation[..4.min(creation.len())], creation.get(12..).unwrap_or(&[])].concat();
+    }
+    blocks[4] = stats.block();
+    let mut out: Vec<u8> = blocks.iter().flat_map(|b| (b.len() as u32).to_le_bytes()).collect();
+    for b in &blocks {
+        out.extend_from_slice(b);
+    }
+    out
 }
 
 /// Rewrites character data stored in the layout this server once assumed,
@@ -493,5 +559,28 @@ mod tests {
     fn splits_headers() {
         assert_eq!(split_header(header(id::WORLD_WELCOME) as u32), (false, 0, 1000));
         assert_eq!(split_header(0x8000 | 0x2000 | 3930), (true, 2, 3930));
+    }
+
+    #[test]
+    fn stats_go_into_block_4_of_the_full_layout() {
+        // A creation block as character creation sends it: version 1,
+        // tribe 2, gender 1, hair 3, skin 4, shirt 5, trousers 6, extras 7-10.
+        let creation: Vec<u8> = [1u32, 2, 1, 3, 4, 5, 6, 7, 8, 9, 10].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut data: Vec<u8> = [44u32, 0, 0, 0, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        data.extend_from_slice(&creation);
+        let stats = Stats { gold: 1234, funnies: 77, ..Stats::default() };
+        let full = with_stats(&data, &stats);
+        let blocks = character_blocks(&full).unwrap();
+        assert_eq!(blocks.map(<[u8]>::len), [12, 36, 0, 0, 20, 0]);
+        assert_eq!(blocks[4], [1u32, 1, 0, 1234, 77].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+        // The look is unchanged.
+        assert_eq!(Style::from_character("A", &full), Style::from_character("A", &data));
+        assert_eq!(Style::from_character("A", &full).tribe_gender, 0x21);
+        // Full data keeps its blocks; only block 4 changes.
+        let again = with_stats(&full, &Stats::default());
+        assert_eq!(character_blocks(&again).unwrap()[..4], blocks[..4]);
+        assert_eq!(character_blocks(&with_stats(b"junk", &stats)).unwrap()[4].len(), 20);
+        // 3201: ownr, lvl, exp, gold, glod, MSB first.
+        assert_eq!(stats.message(9)[..8], [0, 0, 0, 9, 0, 0, 0, 1]);
     }
 }
