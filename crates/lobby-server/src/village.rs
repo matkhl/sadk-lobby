@@ -20,6 +20,8 @@ pub enum Event {
     Cell(Cell),
     /// A lobby message to pass on (match list news, see `games`).
     Lobby(Message),
+    /// A village message to send as it is (table games, see `tables`).
+    Village { id: u16, data: Vec<u8> },
 }
 
 struct Member {

@@ -12,10 +12,14 @@
 pub mod auth;
 pub mod cell;
 pub mod crc;
+pub mod dice;
 pub mod frame;
 pub mod lobby_message;
 pub mod message;
+pub mod minigame;
 pub mod msgdefs;
+pub mod pawnchess;
+pub mod poker;
 pub mod referee;
 
 pub use frame::{Frame, FrameKind, Handshake};

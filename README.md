@@ -23,12 +23,15 @@ Tested with the German retail client, build 34688:
 - matches: host, list ("SPIEL SUCHEN"), join, ready, and the start through
   the referee; both players load the map with their avatars' tribes
 - login from the internet to a server on Linux
+- the tavern table games: pawn chess, dice and Texas Hold'em poker
+  (see [docs/TABLE-GAMES.md](docs/TABLE-GAMES.md))
 
 Known gaps: avatar items and stats are not sent to other players; the MINIGAME chat tab is
 not handled; a letter's sender shows "???" until the reader has seen that
 player (a client limitation); RANDOM tribes are never resolved by the game,
 so a character without a valid tribe crashes map loading. The rankings
-(Hall of Fame) are not implemented.
+(Hall of Fame) are not implemented. Chips won at the tavern tables stay
+at the table: the gold and funnies balance is not updated.
 
 ## Build
 
@@ -103,6 +106,14 @@ in the village). `--say`, `--every`, `--channels`, `--whisper-to`/`--whisper`
 and `--mail-to`/`--mail` control what it says and sends; it prints what it
 receives.
 
+`--chess`, `--dice` or `--poker` with `create` opens a table of that game
+(`--table tavern,table`, default `1,0`), and with `join` sits down at the
+first one with a free seat; the bot then plays. Clients only seat avatars
+they have spawned, so for a game against the real client put the bot in
+the tavern: `--zone 3` (the scene: tavern + 2) and an `--at` inside it.
+`--new-character Name --character-data <hex>` creates a character for the
+account first and plays as it instead of `--perm`.
+
 Two game instances on one PC: `SADK.exe` allows only one (it exits when the
 named mutex `sadk` exists); closing that handle in the first instance (for
 example with Process Explorer) lets a second one start.
@@ -117,6 +128,7 @@ name every message it sends, receives or drops.
 - [docs/PLAYING-ONLINE.md](docs/PLAYING-ONLINE.md): matches over the internet
 - [docs/PROTOCOL.md](docs/PROTOCOL.md): protocol notes (framing, login,
   tokens, village, chat, friends, letters, matches, referee)
+- [docs/TABLE-GAMES.md](docs/TABLE-GAMES.md): the tavern table games
 
 ## Credits
 

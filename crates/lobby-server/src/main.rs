@@ -15,6 +15,7 @@ mod games;
 mod referee;
 mod session;
 mod social;
+mod tables;
 mod tokens;
 mod village;
 
@@ -40,6 +41,8 @@ pub struct Server {
     pub referee: SocketAddr,
     /// Avatars in the lobby village, shared by the village sessions.
     pub world: Mutex<village::Village>,
+    /// Table games in the village taverns, shared by the village sessions.
+    pub tables: Mutex<tables::Tables>,
     /// Chat channel members, shared by the usercomm sessions.
     pub chat: Mutex<chat::Chat>,
     /// Open matches hosted by players, shared by the lobby sessions.
@@ -69,6 +72,7 @@ impl Server {
             usercomm: port(2),
             referee: port(3),
             world: Mutex::default(),
+            tables: Mutex::default(),
             chat: Mutex::default(),
             games: Mutex::default(),
             referee_games: Mutex::default(),
@@ -204,6 +208,15 @@ async fn run() -> Result<(), String> {
         *server.public_ip.write().unwrap() = Some(ip);
         tokio::spawn(follow_public_host(host, server.clone()));
     }
+    // The timed parts of the table games (dice phases).
+    let ticker = server.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            every.tick().await;
+            ticker.tables.lock().unwrap().tick();
+        }
+    });
     let next_id = Arc::new(AtomicU32::new(1));
     tokio::spawn(accept(village_listener, Role::Village, server.clone(), next_id.clone()));
     tokio::spawn(accept(usercomm_listener, Role::Usercomm, server.clone(), next_id.clone()));

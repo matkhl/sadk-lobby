@@ -7,6 +7,7 @@ use sadk_lobby_proto::auth::{self, Credentials};
 use sadk_lobby_proto::cell::{self, Cell, ChannelData};
 use sadk_lobby_proto::frame::{self, Frame, FrameKind, Handshake};
 use sadk_lobby_proto::lobby_message as lm;
+use sadk_lobby_proto::minigame as mg;
 use sadk_lobby_proto::{Message, Value};
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -160,6 +161,11 @@ impl Session {
 
     pub async fn run(mut self, mut stream: TcpStream) -> std::io::Result<()> {
         let result = self.serve(&mut stream).await;
+        // Off the table first: clients must not keep a seat for an avatar
+        // they were told is gone.
+        if self.role == Role::Village {
+            self.server.tables.lock().unwrap().unwatch(self.id);
+        }
         if self.avatar.is_some() {
             self.server.world.lock().unwrap().leave(self.id);
         }
@@ -550,6 +556,7 @@ impl Session {
         info!(conn = self.id, avatar, "entering the village as {}", style.name);
         self.avatar = Some(avatar);
         self.server.world.lock().unwrap().join(self.id, avatar, style, self.events_tx.clone());
+        self.server.tables.lock().unwrap().watch(self.id, avatar, self.events_tx.clone());
     }
 
     /// Village message from the client: 2000 (own position) is shared with
@@ -573,6 +580,7 @@ impl Session {
             },
             lm::id::LEAVE if !typed => {
                 info!(conn = self.id, "leaving the village for a match");
+                self.server.tables.lock().unwrap().unwatch(self.id);
                 if self.avatar.take().is_some() {
                     self.server.world.lock().unwrap().leave(self.id);
                 }
@@ -583,10 +591,59 @@ impl Session {
                 debug!(conn = self.id, "village ping {code:#010x}");
                 self.send_village(lm::id::PONG, lm::single_u32(code));
             }
+            mg::id::CREATE if !typed => self.create_table(data),
+            mg::id::JOIN | mg::id::LEAVE | mg::id::REBUY | 220 | 221 | 300..=302 | 400..=403 if !typed && channel == 5 => self.table_message(id, data),
             _ if self.seen_village_ids.insert(id) => {
                 warn!(conn = self.id, typed, channel, "unhandled village message {id}: {}", hex_preview(data));
             }
             _ => debug!(conn = self.id, "village message {id}: {}", hex_preview(data)),
+        }
+    }
+
+    /// Message 2001 from the matchmaking dialog: open a table and sit down.
+    /// A refusal is answered with 219 ("Kein Tisch mehr frei"): the client
+    /// holds the avatar still until it hears either way.
+    fn create_table(&mut self, data: &[u8]) {
+        let result = mg::CreateTable::parse(data).ok_or(None).and_then(|c| {
+            let result = self.server.tables.lock().unwrap().create(self.id, &c);
+            result.map(|key| (key, c)).map_err(Some)
+        });
+        match result {
+            Ok((key, c)) => info!(conn = self.id, ?key, "table {:?} opened: game {}, tavern {}, table {}, {} seats", c.name, c.kind, c.tavern, c.table, c.max_players),
+            Err(why) => {
+                warn!(conn = self.id, ?why, "table not opened: {}", hex_preview(data));
+                self.send_village(mg::id::NO_TABLE_LEFT, Vec::new());
+            }
+        }
+    }
+
+    /// A table action on channel 5: join (209), leave (204), chips (222)
+    /// or a game move. A refused join is answered with 220 ("Tisch voll").
+    fn table_message(&mut self, id: u16, data: &[u8]) {
+        let mut tables = self.server.tables.lock().unwrap();
+        match id {
+            mg::id::JOIN => {
+                let result = mg::Join::parse(data).ok_or(None).and_then(|j| tables.join(self.id, &j).map(|seat| (j, seat)).map_err(Some));
+                drop(tables);
+                match result {
+                    Ok((j, seat)) => info!(conn = self.id, key = ?j.key, seat, "sat down at a table"),
+                    Err(why) => {
+                        warn!(conn = self.id, ?why, "not seated: {}", hex_preview(data));
+                        self.send_village(mg::id::TABLE_FULL, Vec::new());
+                    }
+                }
+            }
+            mg::id::LEAVE => match tables.leave(self.id) {
+                Some(key) => info!(conn = self.id, ?key, "stood up from a table"),
+                None => debug!(conn = self.id, "table leave without a seat"),
+            },
+            _ => match mg::action(data) {
+                Some((key, mut r)) => match tables.act(self.id, key, id, &mut r) {
+                    Ok(()) => debug!(conn = self.id, ?key, "table action {id}: {}", hex_preview(data)),
+                    Err(why) => warn!(conn = self.id, ?key, ?why, "table action {id} refused: {}", hex_preview(data)),
+                },
+                None => warn!(conn = self.id, "short table action {id}: {}", hex_preview(data)),
+            },
         }
     }
 
@@ -611,6 +668,7 @@ impl Session {
             }
             Event::Cell(cell) => self.send_cell(cell),
             Event::Lobby(msg) => self.send(msg),
+            Event::Village { id, data } => self.send_village(id, data),
         }
     }
 
