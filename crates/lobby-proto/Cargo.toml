@@ -1,0 +1,13 @@
+[package]
+name = "sadk-lobby-proto"
+description = "tincat3 lobby wire format for Die Siedler - Aufbruch der Kulturen"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+p521 = { version = "0.13", features = ["ecdh"] }
+sha2 = "0.10"
+twofish = "0.7"
+getrandom = "0.2"
